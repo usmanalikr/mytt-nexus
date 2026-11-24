@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mytt.brain/contract/curation.schema.json",
+  "title": "curation",
+  "description": "What the model must return for one source item. Validated, retried once, then flagged (D5, AC12). There is no JSON mode on the curator's model, so this schema is the only guard.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_item_id", "outcome", "reason", "items"],
+  "properties": {
+    "source_item_id": { "type": "string", "minLength": 1 },
+    "outcome": {
+      "enum": ["published", "withheld", "flagged"],
+      "description": "published: one or more team items written. withheld: nothing the team needs, or entirely sensitive. flagged: cannot tell, or sensitive but important."
+    },
+    "reason": { "type": "string", "minLength": 1, "maxLength": 400, "description": "One line, for the digest. Never quotes the source." },
+    "flag_reason": { "type": ["string", "null"], "maxLength": 400, "description": "Required when outcome is flagged." },
+    "items": {
+      "type": "array",
+      "maxItems": 3,
+      "description": "One entry per tier that should see this fact, written for that tier (D9). Empty unless outcome is published.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tier", "kind", "title", "body", "status", "left_out"],
+        "properties": {
+          "tier": { "type": "integer", "enum": [1, 2, 3], "description": "1 governance, 2 leads, 3 delivery. Lower is more privileged; an item is readable when the caller's tier <= the item's tier." },
+          "kind": { "enum": ["decision", "scope", "date", "blocker", "action", "technical", "status", "open_question"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "body": { "type": "string", "minLength": 1, "maxLength": 4000 },
+          "status": {
+            "enum": ["proposed", "agreed", "superseded", "n/a"],
+            "description": "A decision is 'proposed' unless the source shows it was agreed (AC11). Anything that is not a decision is 'n/a'."
+          },
+          "left_out": {
+            "type": "array",
+            "description": "Categories removed from this item, never the content itself (AC13).",
+            "items": { "enum": ["commercial", "people", "personal_data", "credentials", "client_relationship", "security_detail", "off_topic"] }
+          },
+          "source_ref": { "type": "string", "maxLength": 300, "description": "Kind, date and title, marked (private). Filled by the curator, not the model." }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "outcome": { "const": "flagged" } }, "required": ["outcome"] },
+      "then": { "required": ["flag_reason"], "properties": { "flag_reason": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "outcome": { "enum": ["withheld", "flagged"] } }, "required": ["outcome"] },
+      "then": { "properties": { "items": { "maxItems": 0 } } }
+    },
+    {
+      "if": { "properties": { "outcome": { "const": "published" } }, "required": ["outcome"] },
+      "then": { "properties": { "items": { "minItems": 1 } } }
+    }
+  ]
+}

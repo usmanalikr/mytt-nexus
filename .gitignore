@@ -1,0 +1,39 @@
+# Secrets. Never commit a real one; .env.example holds names only.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Gathered MyTT content never enters git (see CLAUDE.md, "Hard rules").
+inbox/
+digests/
+meetings/
+fixtures/real/
+*.inbox.json
+*.digest.md
+eval/sample.json
+eval/free.json
+eval/claude.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Deno / node
+node_modules/
+deno.lock
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+
+# OS and editor
+.DS_Store
+Thumbs.db
+*.swp

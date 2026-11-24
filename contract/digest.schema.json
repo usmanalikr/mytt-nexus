@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mytt.brain/contract/digest.schema.json",
+  "title": "digest",
+  "description": "The day's digest. Fixed here in slice 0 because the curator (slice 3) writes it and `brain digest` (slice 4) reads it, and the two are built in parallel.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["day", "outcomes", "tiers", "neurons", "flags_waiting", "left_out", "waiting_for_budget", "sources"],
+  "properties": {
+    "day": { "type": "string", "format": "date" },
+    "outcomes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["published", "withheld", "flagged"],
+      "properties": {
+        "published": { "type": "integer", "minimum": 0 },
+        "withheld": { "type": "integer", "minimum": 0 },
+        "flagged": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Team items written, per tier.",
+      "properties": { "1": { "type": "integer" }, "2": { "type": "integer" }, "3": { "type": "integer" } }
+    },
+    "neurons": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spent", "cap", "per_item"],
+      "description": "Billed from the token counts Workers AI returns, not estimated (D7).",
+      "properties": {
+        "spent": { "type": "integer", "minimum": 0 },
+        "cap": { "type": "integer", "minimum": 0 },
+        "per_item": { "type": "number", "minimum": 0 },
+        "model": { "type": "string", "description": "The CF_MODEL in force, so a change of model is visible in the record." }
+      }
+    },
+    "new_items": {
+      "type": "array",
+      "description": "Titles only, with their tier. No bodies in the digest.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tier", "title"],
+        "properties": { "tier": { "type": "integer" }, "title": { "type": "string" } }
+      }
+    },
+    "flags_waiting": { "type": "integer", "minimum": 0 },
+    "left_out": {
+      "type": "object",
+      "description": "Category to count. Categories, never content.",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "waiting_for_budget": { "type": "integer", "minimum": 0, "description": "Items still queued because the neuron cap was reached (AC16)." },
+    "publish_enabled": { "type": "boolean", "description": "False until the comparison check has passed (D10, AC22). While false every item is flagged." },
+    "sources": {
+      "type": "array",
+      "description": "Freshness per source, so a stalled gather is visible (AC13).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "watermark"],
+        "properties": {
+          "source": { "type": "string" },
+          "watermark": { "type": ["string", "null"], "format": "date-time" },
+          "last_run_at": { "type": ["string", "null"], "format": "date-time" }
+        }
+      }
+    }
+  }
+}

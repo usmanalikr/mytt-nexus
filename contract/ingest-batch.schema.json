@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mytt.brain/contract/ingest-batch.schema.json",
+  "title": "ingest-batch",
+  "description": "What `brain ingest` posts to the brain-ingest Edge Function. One transaction per batch (D12).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["batch_id", "gathered_at", "items", "watermarks"],
+  "properties": {
+    "batch_id": { "type": "string", "format": "uuid", "description": "Idempotency key. Re-posting the same batch_id must not duplicate rows (AC1)." },
+    "gathered_at": { "type": "string", "format": "date-time" },
+    "items": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "inbox-item.schema.json" }
+    },
+    "watermarks": {
+      "type": "array",
+      "description": "Only advanced for sources that were gathered successfully in this run.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "watermark"],
+        "properties": {
+          "source": { "type": "string" },
+          "watermark": { "type": "string", "format": "date-time" },
+          "last_run_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mytt.brain/contract/inbox-item.schema.json",
+  "title": "inbox-item",
+  "description": "One gathered source item, already screened. Slice 0 fixes this shape; the gather writes it, brain-ingest validates it again on arrival.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "source_id", "kind", "body", "screened"],
+  "properties": {
+    "source": {
+      "description": "Which system it came from. One value per loader.",
+      "enum": [
+        "em_tracker.meetings",
+        "em_tracker.meeting_items",
+        "em_tracker.transcript_sentences",
+        "em_tracker.tasks",
+        "em_tracker.task_comments",
+        "em_tracker.sprints",
+        "clickup.tasks",
+        "clickup.task_comments",
+        "clickup.sprints",
+        "clickup.chat",
+        "sheet.backlog",
+        "sheet.user_stories",
+        "sheet.open_questions"
+      ]
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable id within the source. (source, source_id) is the upsert key."
+    },
+    "kind": {
+      "enum": ["meeting", "meeting_item", "transcript", "task", "task_comment", "sprint", "backlog_row", "chat_thread", "decision", "open_question"]
+    },
+    "title": { "type": ["string", "null"], "maxLength": 500 },
+    "body": { "type": "string", "description": "Screened text. Redactions appear as [redacted: <category>]." },
+    "url": { "type": ["string", "null"], "format": "uri" },
+    "occurred_at": { "type": ["string", "null"], "format": "date-time" },
+    "project": {
+      "type": ["string", "null"],
+      "description": "The source's own project field, used by the scope rules. Null means unknown, which sends the item to intake_review rather than into the brain (AC2)."
+    },
+    "body_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Of the screened body. brain-ingest re-queues an item whose hash changed."
+    },
+    "screened": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patterns_version", "hits"],
+      "description": "What the screen did. Present even when it did nothing, so an unscreened item is distinguishable from a clean one.",
+      "properties": {
+        "patterns_version": { "type": "string", "description": "patterns.json version the gather used." },
+        "hits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["pattern_id", "category", "count"],
+            "properties": {
+              "pattern_id": { "type": "string" },
+              "category": { "enum": ["secret", "personal", "money", "never_published"] },
+              "count": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "withheld": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when the whole item is from a never-published source. A withheld item is never sent at all; the field exists so the gather can log the decision."
+        }
+      }
+    }
+  }
+}

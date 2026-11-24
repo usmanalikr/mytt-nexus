@@ -1,0 +1,97 @@
+{
+  "version": "1.0.0",
+  "note": "Golden cases for the screen, read by both the Python tests and the Deno tests. The screen runs three times in three places (D6), and two of those are in TypeScript, so 'the same patterns' is not enough on its own: the same patterns applied in a different order, or with a different allow pass, redact different things. These cases are what 'the same' means. Add a case here before fixing a screen bug, not after.",
+  "cases": [
+    {
+      "id": "secret-prefixed-key",
+      "in": "Deploy with sbp_abcdef0123456789abcdef0123 tonight.",
+      "out": "Deploy with [redacted: key] tonight.",
+      "hits": ["prefixed-key"]
+    },
+    {
+      "id": "secret-jwt",
+      "in": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk expires soon.",
+      "out": "Bearer [redacted: token] expires soon.",
+      "hits": ["jwt"]
+    },
+    {
+      "id": "secret-connection-string",
+      "in": "Use postgresql://admin:hunter2@db.example.com:5432/mytt for the migration.",
+      "out": "Use [redacted: connection string] for the migration.",
+      "hits": ["url-with-credentials"]
+    },
+    {
+      "id": "personal-email-and-ticket",
+      "in": "Email alex.doe@example.com about DEV-39397.",
+      "out": "Email [redacted: email] about DEV-39397.",
+      "hits": ["email"]
+    },
+    {
+      "id": "personal-phone-tt",
+      "in": "Call +1-868-555-1234 before noon.",
+      "out": "Call [redacted: phone] before noon.",
+      "hits": ["phone-tt"]
+    },
+    {
+      "id": "personal-phone-pk",
+      "in": "Ring Priya on +92 300 1234567 before the standup.",
+      "out": "Ring Priya on [redacted: phone] before the standup.",
+      "hits": ["phone-pk"]
+    },
+    {
+      "id": "personal-long-digit-run",
+      "in": "Account 123456789012 and ticket ABC-1234.",
+      "out": "Account [redacted: id] and ticket ABC-1234.",
+      "hits": ["long-digit-run"]
+    },
+    {
+      "id": "money-rate",
+      "in": "Rate is $150 per hour for the extension.",
+      "out": "Rate is [redacted: rate] for the extension.",
+      "hits": ["rate"]
+    },
+    {
+      "id": "money-amount",
+      "in": "The invoice came to TTD 42,000.50 in the end.",
+      "out": "The invoice came to [redacted: amount] in the end.",
+      "hits": ["currency-prefixed"]
+    },
+    {
+      "id": "money-hours-billed",
+      "in": "37.5 hours billed this sprint.",
+      "out": "[redacted: hours billed] this sprint.",
+      "hits": ["hours-billed"]
+    },
+    {
+      "id": "leaves-identifiers-alone",
+      "in": "DEV-39397 shipped in v2.14.1 and 2.14.1 on 2026-11-20 at 09:30, see #4821, 85% done.",
+      "out": "DEV-39397 shipped in v2.14.1 and 2.14.1 on 2026-11-20 at 09:30, see #4821, 85% done.",
+      "hits": []
+    },
+    {
+      "id": "leaves-counts-alone",
+      "in": "8 points carried over across 3 tickets in sprint 7.",
+      "out": "8 points carried over across 3 tickets in sprint 7.",
+      "hits": []
+    },
+    {
+      "id": "leaves-dates-and-blockers-alone",
+      "in": "Release moved to 5 Dec; the blocker is the upload service.",
+      "out": "Release moved to 5 Dec; the blocker is the upload service.",
+      "hits": []
+    },
+    {
+      "id": "mixed",
+      "in": "Deadline 5 Dec for DEV-401; budget PKR 1,250,000 agreed; contact +92 300 1234567.",
+      "out": "Deadline 5 Dec for DEV-401; budget [redacted: amount] agreed; contact [redacted: phone].",
+      "hits": ["phone-pk", "currency-prefixed"]
+    },
+    {
+      "id": "repeats-are-counted-not-collapsed",
+      "in": "a@example.com, b@example.com and c@example.com",
+      "out": "[redacted: email], [redacted: email] and [redacted: email]",
+      "hits": ["email"],
+      "counts": { "email": 3 }
+    }
+  ]
+}
