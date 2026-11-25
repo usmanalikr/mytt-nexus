@@ -7,8 +7,8 @@
 // Slice T owns this file. It fails until slice 3 exists.
 
 import { assertEquals, assertRejects } from "../_shared/testing.ts";
-import { runBatch, type CuratorDeps, type QueuedItem } from "./index.ts";
-import { CURATOR_DEFAULTS, type Curation } from "../_shared/types.ts";
+import { runBatch, triggerAllowed, type CuratorDeps, type QueuedItem } from "./index.ts";
+import { CURATOR_DEFAULTS, CURATOR_TOKEN_HEADER, type Curation } from "../_shared/types.ts";
 
 function queued(n: number): QueuedItem[] {
   return Array.from({ length: n }, (_, i) => ({
@@ -325,4 +325,84 @@ Deno.test("curator_publish_switch", async () => {
   for (const outcome of d.written.outcomes) {
     assertEquals(outcome.outcome, "flagged");
   }
+});
+
+Deno.test("record is given the queue message id, not the item id", async () => {
+  // pgmq.delete takes the message id (a bigint). Passing the item's uuid
+  // made every record transaction roll back in production.
+  const seen: number[] = [];
+  const d = deps({
+    take: () => Promise.resolve(queued(2)),
+    record: (_curation, _items, msgId) => {
+      seen.push(msgId);
+      return Promise.resolve();
+    },
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(seen, [1, 2]);
+});
+
+Deno.test("the curator records under the queued item's id, whatever the model answers", async () => {
+  // The model's source_item_id is not trusted: an invented or wrong id would
+  // attach an outcome, and a published item, to the wrong private item.
+  const d = deps({
+    take: () => Promise.resolve(queued(1)),
+    callModel: () => Promise.resolve({ json: published("WRONG"), tokensIn: 100, tokensOut: 100 }),
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.written.outcomes.length, 1);
+  assertEquals(d.written.outcomes[0].source_item_id, "i1");
+});
+
+Deno.test("the model is told which item it is curating", async () => {
+  const d = deps({ take: () => Promise.resolve(queued(1)) });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.calls[0].prompt.includes("source_item_id: i1"), true);
+  assertEquals(d.calls[0].prompt.includes("kind: meeting"), true);
+});
+
+Deno.test("a batch that fails closes its run row as failed, not ok", async () => {
+  // D8: the run row is the only evidence a batch ran. A row that says `ok`
+  // after a failure hides the failure from `brain status`.
+  const d = deps({
+    take: () => Promise.resolve(queued(1)),
+    record: () => Promise.reject(new Error("the transaction failed")),
+  });
+
+  await assertRejects(() => runBatch(d.deps));
+
+  const closed = d.runs.find((r) => r.id === "run-1");
+  assertEquals(closed?.status, "failed");
+});
+
+Deno.test("a failure reading the day's spend still closes the run row", async () => {
+  const d = deps({ neuronsSpentToday: () => Promise.reject(new Error("db down")) });
+
+  await assertRejects(() => runBatch(d.deps));
+
+  const closed = d.runs.find((r) => r.id === "run-1");
+  assertEquals(closed?.status, "failed");
+});
+
+Deno.test("the curator runs only for a caller with its trigger token", () => {
+  // Deployed without Supabase's JWT check so pg_cron can call it, the
+  // function would otherwise run a batch, and spend the neuron budget, for
+  // anyone who knows its URL.
+  const expected = "test-curator-token-not-a-real-one";
+  const call = (headers: Record<string, string>) =>
+    triggerAllowed(new Request("https://example.supabase.co/brain-curator", { method: "POST", headers }), expected);
+
+  assertEquals(call({}), false, "no token");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: "" }), false, "empty token");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: "wrong" }), false, "wrong token");
+  assertEquals(call({ Authorization: `Bearer ${expected}` }), false, "only its own header counts");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: expected }), true);
+  assertEquals(triggerAllowed(new Request("https://x", { headers: { [CURATOR_TOKEN_HEADER]: "" } }), ""), false,
+    "an unset expected token never matches");
 });

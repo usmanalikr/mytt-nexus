@@ -59,6 +59,18 @@ class Screen:
 
         held: dict[str, str] = {}
         working = text
+        hits: list[ScreenHit] = []
+
+        # Secrets first, on the raw text. Nothing the allow pass protects -- a
+        # ticket id, a date, a version -- may shield part of a secret:
+        # "password=ADMIN-1234" must not survive because ADMIN-1234 looks like
+        # a ticket.
+        for rule in self._rules:
+            if rule.category != "secret":
+                continue
+            working, count = rule.regex.subn(rule.replacement, working)
+            if count:
+                hits.append(ScreenHit(pattern_id=rule.id, category=rule.category, count=count))
 
         # Hold aside everything the contract says must survive, longest first:
         # "v2.14.1" has to be taken before "2.14.1", or the shorter match would
@@ -73,8 +85,9 @@ class Screen:
                 held[key] = match
                 working = working.replace(match, key)
 
-        hits: list[ScreenHit] = []
         for rule in self._rules:
+            if rule.category == "secret":
+                continue
             working, count = rule.regex.subn(rule.replacement, working)
             if count:
                 hits.append(ScreenHit(pattern_id=rule.id, category=rule.category, count=count))

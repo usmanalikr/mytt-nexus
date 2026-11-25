@@ -93,12 +93,21 @@ export interface IngestResponse {
   queued: number;
   sent_to_review: number;
   rejected: number;
+  /** Never-published sources, or items the gather already withheld: dropped. */
+  withheld: number;
 }
 
 /** The ingest token's header. Never `Authorization`: the cloud environment
  *  attaches network secrets by host, and the project host also serves the REST
  *  API and Auth, which other callers reach with their own bearer token (D12). */
 export const INGEST_TOKEN_HEADER = "X-Brain-Ingest-Token";
+
+/** The curator's trigger token. pg_cron sends it, read from Supabase Vault
+ *  (`brain_curator_token`); the function compares it with the Edge Function
+ *  secret BRAIN_CURATOR_TOKEN. The function is deployed without the JWT check
+ *  so pg_net can reach it, so this header is the only thing standing between
+ *  its URL and the neuron budget. */
+export const CURATOR_TOKEN_HEADER = "X-Brain-Curator-Token";
 
 /** A batch above this is refused; the endpoint is public by design. */
 export const INGEST_MAX_BODY_BYTES = 1_048_576;

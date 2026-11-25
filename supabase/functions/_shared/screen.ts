@@ -66,6 +66,21 @@ export function screenText(text: string): ScreenResult {
 
   const held = new Map<string, string>();
   let working = text;
+  const hits: ScreenHit[] = [];
+
+  const apply = (rule: (typeof RULES)[number]) => {
+    rule.regex.lastIndex = 0;
+    const count = [...working.matchAll(rule.regex)].length;
+    if (count === 0) return;
+    rule.regex.lastIndex = 0;
+    working = working.replace(rule.regex, rule.replacement);
+    hits.push({ pattern_id: rule.id, category: rule.category, count });
+  };
+
+  // Secrets first, on the raw text. Nothing the allow pass protects — a ticket
+  // id, a date, a version — may shield part of a secret: "password=ADMIN-1234"
+  // must not survive because ADMIN-1234 looks like a ticket.
+  for (const rule of RULES) if (rule.category === "secret") apply(rule);
 
   // Hold aside everything the contract says must survive, longest first:
   // "v2.14.1" has to be taken before "2.14.1", or the shorter match would cut
@@ -84,15 +99,7 @@ export function screenText(text: string): ScreenResult {
     }
   }
 
-  const hits: ScreenHit[] = [];
-  for (const rule of RULES) {
-    rule.regex.lastIndex = 0;
-    const count = [...working.matchAll(rule.regex)].length;
-    if (count === 0) continue;
-    rule.regex.lastIndex = 0;
-    working = working.replace(rule.regex, rule.replacement);
-    hits.push({ pattern_id: rule.id, category: rule.category, count });
-  }
+  for (const rule of RULES) if (rule.category !== "secret") apply(rule);
 
   for (const [key, value] of held) {
     working = working.split(key).join(value);

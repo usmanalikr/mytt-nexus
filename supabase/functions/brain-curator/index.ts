@@ -21,12 +21,20 @@
 
 import {
   CURATOR_DEFAULTS,
+  CURATOR_TOKEN_HEADER,
   type Curation,
   type CuratedItem,
   type CuratorSettings,
   neuronsFor,
 } from "../_shared/types.ts";
 import { screenText } from "../_shared/screen.ts";
+import { headerTokenMatches } from "../_shared/token.ts";
+
+/** Whether this request may start a batch. Checked before anything else,
+ *  including opening a database connection's worth of work. */
+export function triggerAllowed(request: Request, expected: string): boolean {
+  return headerTokenMatches(request, CURATOR_TOKEN_HEADER, expected);
+}
 
 export interface QueuedItem {
   msg_id: number;
@@ -51,8 +59,9 @@ export interface CuratorDeps {
   deadline: number;
   take(n: number): Promise<QueuedItem[]>;
   callModel(call: { prompt: string; body: string }): Promise<ModelAnswer>;
-  /** One transaction: the outcome and its items land together or not at all. */
-  record(curation: Curation, items: CuratedItem[]): Promise<void>;
+  /** One transaction: the outcome, its items and the deletion of queue message
+   *  `msgId` land together or not at all. */
+  record(curation: Curation, items: CuratedItem[], msgId: number): Promise<void>;
   requeue(msgId: number): Promise<void>;
   openRun(row: Record<string, unknown>): Promise<string>;
   closeRun(id: string, row: Record<string, unknown>): Promise<void>;
@@ -87,7 +96,13 @@ export async function policy(): Promise<string> {
   );
 }
 
-function prompt(policyBody: string, item: QueuedItem): string {
+/** The system prompt for one item: the policy, byte for byte, then the item's
+ *  identity. Exported so the comparison check (eval/curate.ts) sends exactly
+ *  what production sends. */
+export function prompt(
+  policyBody: string,
+  item: Pick<QueuedItem, "private_item_id" | "kind" | "title">,
+): string {
   return policyBody +
     "\n\n---\n\n" +
     "You are curating one source item for the MyTT brain. Follow the policy above exactly.\n" +
@@ -180,14 +195,18 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
   // it would leave nothing at all (D8).
   const runId = await deps.openRun({ kind: "curate", model: settings.model });
 
-  let spent = await deps.neuronsSpentToday();
-  const startingSpend = spent;
+  let spent = 0;
+  let startingSpend = 0;
   let done = 0;
   let taken = 0;
-  let stoppedBy: "ok" | "budget_reached" = "ok";
+  let stoppedBy: "ok" | "budget_reached" | "failed" = "ok";
   const durations: number[] = [];
 
   try {
+    // Inside the try, so a failure here still closes the run row.
+    spent = await deps.neuronsSpentToday();
+    startingSpend = spent;
+
     const items = await deps.take(settings.batchSize);
     taken = items.length;
 
@@ -220,7 +239,7 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       const startedAt = deps.now();
       let answer: ModelAnswer;
       try {
-        answer = await deps.callModel({ prompt: await policy() + "", body });
+        answer = await deps.callModel({ prompt: prompt(await policy(), item), body });
       } catch (error) {
         // A model failure is this item's problem, not the batch's: it goes
         // back on the queue and the next item is tried.
@@ -238,7 +257,7 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
         // AC12 — one retry, not none and not a loop. There is no JSON mode on
         // this model (D5), so a malformed answer is expected occasionally.
         try {
-          const retry = await deps.callModel({ prompt: await policy() + "", body });
+          const retry = await deps.callModel({ prompt: prompt(await policy(), item), body });
           spent += neuronsFor(settings.model, retry.tokensIn, retry.tokensOut);
           curation = retry.json;
           problem = invalidCuration(curation);
@@ -252,6 +271,10 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
         curation = asFlagged(item, `the curator could not produce a valid answer: ${problem}`);
       }
 
+      // The id comes from the queue, never from the model: an invented or
+      // mistaken id would attach this outcome to another private item.
+      curation = { ...curation, source_item_id: item.private_item_id };
+
       if (!settings.publishEnabled && curation.outcome === "published") {
         // AC22 — until the comparison against Claude passes, nothing this
         // model publishes can be read by anyone (D10). The model's answer is
@@ -263,9 +286,12 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       }
 
       const written: CuratedItem[] = curation.outcome === "published" ? curation.items : [];
-      await deps.record(curation, written);
+      await deps.record(curation, written, item.msg_id);
       done += 1;
     }
+  } catch (error) {
+    stoppedBy = "failed";
+    throw error;
   } finally {
     await deps.closeRun(runId, {
       status: stoppedBy,

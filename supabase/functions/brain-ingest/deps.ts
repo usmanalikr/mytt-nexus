@@ -60,7 +60,14 @@ function bind(sql: any): Omit<Deps, "token" | "scopeRules"> {
       // The hash decides whether this is new work. An item whose body is
       // unchanged is not re-queued, which is what keeps eight gathers a day
       // costing little more than one (D8).
+      // `excluded` cannot be named in RETURNING, and inside RETURNING the
+      // table's columns already hold the new values. So the previous hash is
+      // read in a CTE, which sees the snapshot from before the statement ran.
       const [row] = await sql`
+        with prior as (
+          select body_sha256 from brain_private.items
+          where source = ${item.source} and source_id = ${item.source_id}
+        )
         insert into brain_private.items
           (source, source_id, kind, title, body, url, occurred_at, project,
            body_sha256, screen_hits, patterns_version)
@@ -81,7 +88,7 @@ function bind(sql: any): Omit<Deps, "token" | "scopeRules"> {
           patterns_version = excluded.patterns_version,
           updated_at = now()
         returning id, (xmax = 0) as inserted,
-                  (brain_private.items.body_sha256 is distinct from excluded.body_sha256) as changed
+                  ((select body_sha256 from prior) is distinct from ${item.body_sha256 ?? ""}) as changed
       `;
 
       const changed = row.inserted || row.changed;

@@ -212,3 +212,46 @@ Deno.test("ingest re-screens what it is given", async () => {
     "a secret the gather missed must not reach storage",
   );
 });
+
+Deno.test("ingest withholds a never-published source whatever the caller says", async () => {
+  // AC6, at the endpoint. The gather drops these sources, but a public endpoint
+  // cannot know that the gather ran: an item posted straight to it with
+  // `withheld: false` must still never be stored or queued for the curator.
+  const d = deps();
+  const worklog = batch();
+  worklog.items[0].source = "em_tracker.worklog_shortfalls";
+  worklog.items[0].screened = { patterns_version: "1.0.0", hits: [], withheld: false };
+
+  const response = await handler(post(worklog), d);
+
+  assertEquals(response.status, 200);
+  assertEquals(d.items.size, 0, "a never-published source must not be stored");
+  assertEquals(d.queued.length, 0, "a never-published source must not reach the curator");
+  assertEquals((await response.json()).withheld, 1);
+});
+
+Deno.test("ingest withholds an item the caller marked withheld", async () => {
+  const d = deps();
+  const marked = batch();
+  marked.items[0].screened = { patterns_version: "1.0.0", hits: [], withheld: true };
+
+  await handler(post(marked), d);
+
+  assertEquals(d.items.size, 0);
+  assertEquals(d.queued.length, 0);
+});
+
+Deno.test("ingest screens the title and the url, not only the body", async () => {
+  // A meeting title can carry a person's email, and `brain review` offers the
+  // title as the published title by default.
+  const d = deps();
+  const leaky = batch();
+  leaky.items[0].title = "Call with jane.doe@example.com about access";
+  leaky.items[0].url = "https://app:hunter2hunter2@tracker.example.com/m/1";
+
+  await handler(post(leaky), d);
+
+  const stored = [...d.items.values()][0];
+  assertEquals(String(stored.title).includes("jane.doe@example.com"), false);
+  assertEquals(String(stored.url).includes("hunter2hunter2"), false);
+});

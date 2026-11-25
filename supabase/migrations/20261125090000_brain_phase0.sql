@@ -448,7 +448,13 @@ begin
       $cron$
         select net.http_post(
           url     := current_setting('app.settings.curator_url', true),
-          headers := jsonb_build_object('Content-Type', 'application/json'),
+          -- brain-curator is deployed without the JWT check so this call can
+          -- reach it, and it refuses any request without this token. The
+          -- token lives in Supabase Vault, never in this file.
+          headers := jsonb_build_object(
+            'Content-Type', 'application/json',
+            'X-Brain-Curator-Token', (select decrypted_secret from vault.decrypted_secrets
+                                      where name = 'brain_curator_token')),
           body    := '{}'::jsonb,
           timeout_milliseconds := 1000
         );
