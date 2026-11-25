@@ -154,14 +154,14 @@ def test_a_category_claude_removed_is_ignored_when_nothing_was_published():
 def test_one_failure_fails_the_whole_check():
     """Thirty items stand for thirty classes of material, so a single item
     published too widely is a class published too widely."""
-    claude = [curation(f"i{n}", tiers=(3,)) for n in range(10)]
-    free = [curation(f"i{n}", tiers=(3,)) for n in range(10)]
+    claude = [curation(f"i{n}", tiers=(3,)) for n in range(30)]
+    free = [curation(f"i{n}", tiers=(3,)) for n in range(30)]
     free[7] = curation("i7", tiers=(3,), left_out=())
     claude[7] = curation("i7", tiers=(1,))
 
     verdict = compare(claude, free)
 
-    assert verdict.compared == 10
+    assert verdict.compared == 30
     assert not verdict.passed
     assert len(verdict.failures) == 1
 
@@ -188,8 +188,92 @@ def test_the_report_says_what_to_do_next():
 def test_the_report_counts_the_cautious_cases():
     """A model that withheld everything would pass the gate perfectly, so the
     report has to surface how often it was quieter than Claude."""
-    verdict = compare([curation("i1", tiers=(3,))], [curation("i1", "withheld")])
+    claude = [curation(f"i{n}", tiers=(3,)) for n in range(30)]
+    free = [curation(f"i{n}", tiers=(3,)) for n in range(29)] + [curation("i29", "withheld")]
+    verdict = compare(claude, free)
     text = report(verdict, "@cf/google/gemma-4-26b-a4b-it")
 
     assert "PASS" in text
     assert "More cautious than Claude" in text
+
+
+# --- the sample itself ---------------------------------------------------------------
+
+
+def test_an_empty_comparison_fails():
+    """Nothing compared is not a pass. An empty pair of files once produced
+    "PASS ... Publishing may be switched on"."""
+    verdict = compare([], [])
+
+    assert not verdict.passed
+    assert "FAIL" in report(verdict, "m")
+    assert "Publishing may be switched on" not in report(verdict, "m")
+
+
+def test_fewer_than_thirty_sources_fails():
+    """AC17 asks for 30 sources across the kinds."""
+    claude = [curation(f"i{n}") for n in range(29)]
+    verdict = compare(claude, [curation(f"i{n}") for n in range(29)])
+
+    assert not verdict.passed
+    assert any(f.kind == "sample too small" for f in verdict.failures)
+
+
+def test_an_answer_for_a_source_claude_never_saw_fails():
+    """The two runs must be over the same sample, or the comparison is of
+    nothing in particular."""
+    claude = [curation(f"i{n}") for n in range(30)]
+    free = [curation(f"i{n}") for n in range(30)] + [curation("stray")]
+
+    verdict = compare(claude, free)
+
+    assert not verdict.passed
+    assert any(f.source_item_id == "stray" for f in verdict.failures)
+
+
+def test_a_category_claude_removed_must_go_from_each_item_not_just_one():
+    """Claude removed commercial detail from its whole-team item. The free
+    model removed it only from a governance item and kept it in the whole-team
+    one: the union of its categories matched Claude's, but the whole team
+    reads the commercial detail."""
+    claude = curation("i1", tiers=(3,), left_out=("commercial",))
+    free = {
+        **curation("i1", tiers=(1, 3)),
+        "items": [
+            {**curation("i1", tiers=(1,), left_out=("commercial",))["items"][0]},
+            {**curation("i1", tiers=(3,))["items"][0]},
+        ],
+    }
+
+    failures, _ = compare_one(claude, free)
+
+    assert any(f.kind == "kept a category Claude removed" for f in failures)
+
+
+def test_a_narrow_item_may_not_keep_what_claude_never_let_anyone_see():
+    """Claude published only to the whole team, without the commercial detail.
+    A governance-only item that keeps it still lets that detail reach someone
+    Claude never showed it to."""
+    claude = curation("i1", tiers=(3,), left_out=("commercial",))
+    free = curation("i1", tiers=(1,))
+
+    failures, _ = compare_one(claude, free)
+
+    assert any(f.kind == "kept a category Claude removed" for f in failures)
+
+
+def test_a_narrow_item_may_keep_what_claude_kept_for_that_audience():
+    """Claude kept the commercial detail for governance and removed it for the
+    whole team. A free-model governance item that keeps it is not a leak."""
+    claude = {
+        **curation("i1", tiers=(1, 3)),
+        "items": [
+            {**curation("i1", tiers=(1,))["items"][0]},
+            {**curation("i1", tiers=(3,), left_out=("commercial",))["items"][0]},
+        ],
+    }
+    free = curation("i1", tiers=(1,))
+
+    failures, _ = compare_one(claude, free)
+
+    assert failures == []

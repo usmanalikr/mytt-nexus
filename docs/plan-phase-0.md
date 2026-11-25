@@ -127,9 +127,15 @@ tests:
   | Role | Used by | May | Connection kept in |
   |---|---|---|---|
   | `brain_intake` | The `brain-ingest` Edge Function | Write `brain_private.items`, `intake_review`, `sources` and the queue | Edge Function secret `BRAIN_INTAKE_DB_URL` |
-  | `brain_curator` | The `brain-curator` Edge Function | Read `brain_private.items` and the queue; write `brain.items`, `outcomes`, `flags` and `runs` | Edge Function secret `BRAIN_CURATOR_DB_URL` |
+  | `brain_curator` | The `brain-curator` Edge Function | Read `brain_private.items` and the queue; update only the `screen_hits` of a private item (AC20); write `brain.items`, `outcomes`, `flags` and `runs` | Edge Function secret `BRAIN_CURATOR_DB_URL` |
 
   Reading `em_tracker` stays with the read-only Supabase connector during gathering.
+
+  *Changed by the review on 25 Nov:*
+  - **Neither role has `BYPASSRLS`.** That attribute covers every table in the database, not just the brain's. Each role instead has its own RLS policy on the brain tables it is granted.
+  - **Queue grants cover `pgmq.q_brain_curation` only,** not every queue in the project.
+  - **The curator may update `screen_hits`** (a column grant), so its re-screen can record what it caught. It still cannot change a private body.
+  - **MCP search goes through `brain.search_items(q)`,** a `SECURITY INVOKER` RPC. The search term travels in the request body instead of a URL, which would put it in the platform's request logs.
 - **D3. You apply the migrations.** Sessions write them as files under `supabase/migrations/`, and you apply them with the Supabase CLI or the dashboard's SQL editor. Sessions never hold a key that can change the production schema.
 - **D4. The MCP service is a Supabase Edge Function**, `brain-mcp`.
   - **Sign-in:** Claude signs in to it with Supabase Auth's built-in OAuth server, so you sign in with your own account.
@@ -368,6 +374,7 @@ None. `em_tracker` and every other source is only read.
 | `brain_intake` connection | secret | Edge Function secret `BRAIN_INTAKE_DB_URL` | you, after the migration |
 | `brain_curator` connection | secret | Edge Function secret `BRAIN_CURATOR_DB_URL` | you, after the migration |
 | Ingest token | secret | Edge Function secret `BRAIN_INGEST_TOKEN`, and a **network secret** in the cloud environment for the project's host, sent as `X-Brain-Ingest-Token` and never as `Authorization` (D12) | you |
+| Curator trigger token | secret | Edge Function secret `BRAIN_CURATOR_TOKEN`, **and the same value in Supabase Vault** as `brain_curator_token` (`select vault.create_secret('<value>', 'brain_curator_token')`). The cron job reads it from Vault and sends it as `X-Brain-Curator-Token`; the function refuses any call without it and won't start if it is unset. Added by the review on 25 Nov: `brain-curator` must be deployed with `--no-verify-jwt` so `pg_net` can reach it, and without this token anyone with its URL could run batches and spend the neuron budget | you, before the cron job is unpaused |
 | Cloudflare account id | config | Edge Function secret `CF_ACCOUNT_ID` | you |
 | Cloudflare API token (Workers AI scope only) | secret | Edge Function secret `CF_API_TOKEN` | you |
 | Curator model id | config | Edge Function secret `CF_MODEL`, default `@cf/google/gemma-4-26b-a4b-it` | you, changed without a redeploy (D5) |
@@ -380,8 +387,8 @@ No secret is ever written to the repository or a file. Edge Function secrets are
 
 - **Release:**
   1. Apply the migration, then add `brain` and `brain_private` to the project's exposed schemas.
-  2. Create the Cloudflare API token and the ingest token, and set the Edge Function secrets.
-  3. Deploy the `brain-ingest`, `brain-curator` and `brain-mcp` Edge Functions, once every automated test (AC1–AC16, AC19–AC23) passes. `CURATOR_PUBLISH_ENABLED` stays off.
+  2. Create the Cloudflare API token, the ingest token and the curator trigger token, set the Edge Function secrets, and put the curator trigger token in Vault as `brain_curator_token`.
+  3. Deploy the `brain-ingest`, `brain-curator` and `brain-mcp` Edge Functions (`brain-ingest` and `brain-curator` with `--no-verify-jwt`; each checks its own token), once every automated test (AC1–AC16, AC19–AC23) passes. `CURATOR_PUBLISH_ENABLED` stays off.
   4. Unpause the cron job (the migration creates it paused) and do a hand-started `brain run` in a session; read the digest (AC18). Everything is flagged at this point, by design.
   5. Run the comparison check (AC17) on the real material the backfill has gathered, and read its measured neurons-per-item back into D8.
   6. Turn `CURATOR_PUBLISH_ENABLED` on, and re-curate the flagged backlog.

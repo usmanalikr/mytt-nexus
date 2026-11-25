@@ -7,8 +7,8 @@
 // Slice T owns this file. It fails until slice 3 exists.
 
 import { assertEquals, assertRejects } from "../_shared/testing.ts";
-import { runBatch, type CuratorDeps, type QueuedItem } from "./index.ts";
-import { CURATOR_DEFAULTS, type Curation } from "../_shared/types.ts";
+import { ModelRefused, runBatch, triggerAllowed, type CuratorDeps, type QueuedItem } from "./index.ts";
+import { CURATOR_DEFAULTS, CURATOR_TOKEN_HEADER, type Curation } from "../_shared/types.ts";
 
 function queued(n: number): QueuedItem[] {
   return Array.from({ length: n }, (_, i) => ({
@@ -42,6 +42,8 @@ function published(id: string, tier: 1 | 2 | 3 = 3): Curation {
 function deps(overrides: Partial<CuratorDeps> = {}) {
   const written = { items: [] as unknown[], outcomes: [] as Curation[], flags: [] as unknown[] };
   const requeued: number[] = [];
+  const retried: QueuedItem[] = [];
+  const extras: { attempt: number; screenHits: { pattern_id: string }[] }[] = [];
   const runs: Record<string, unknown>[] = [];
   const calls: { prompt: string; body: string }[] = [];
   const base: CuratorDeps = {
@@ -58,7 +60,8 @@ function deps(overrides: Partial<CuratorDeps> = {}) {
         tokensOut: 500,
       });
     },
-    record: (curation, items) => {
+    record: (curation, items, _msgId, extra) => {
+      extras.push(extra);
       written.outcomes.push(curation);
       written.items.push(...items);
       if (curation.outcome === "flagged") written.flags.push(curation);
@@ -66,6 +69,10 @@ function deps(overrides: Partial<CuratorDeps> = {}) {
     },
     requeue: (msgId) => {
       requeued.push(msgId);
+      return Promise.resolve();
+    },
+    retryLater: (item) => {
+      retried.push(item);
       return Promise.resolve();
     },
     openRun: (row) => {
@@ -79,7 +86,7 @@ function deps(overrides: Partial<CuratorDeps> = {}) {
     neuronsSpentToday: () => Promise.resolve(0),
     writeDigest: () => Promise.resolve(),
   };
-  return { deps: { ...base, ...overrides }, written, requeued, runs, calls };
+  return { deps: { ...base, ...overrides }, written, requeued, retried, extras, runs, calls };
 }
 
 Deno.test("test_record_all_or_nothing", async () => {
@@ -325,4 +332,151 @@ Deno.test("curator_publish_switch", async () => {
   for (const outcome of d.written.outcomes) {
     assertEquals(outcome.outcome, "flagged");
   }
+});
+
+Deno.test("record is given the queue message id, not the item id", async () => {
+  // pgmq.delete takes the message id (a bigint). Passing the item's uuid
+  // made every record transaction roll back in production.
+  const seen: number[] = [];
+  const d = deps({
+    take: () => Promise.resolve(queued(2)),
+    record: (_curation, _items, msgId) => {
+      seen.push(msgId);
+      return Promise.resolve();
+    },
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(seen, [1, 2]);
+});
+
+Deno.test("the curator records under the queued item's id, whatever the model answers", async () => {
+  // The model's source_item_id is not trusted: an invented or wrong id would
+  // attach an outcome, and a published item, to the wrong private item.
+  const d = deps({
+    take: () => Promise.resolve(queued(1)),
+    callModel: () => Promise.resolve({ json: published("WRONG"), tokensIn: 100, tokensOut: 100 }),
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.written.outcomes.length, 1);
+  assertEquals(d.written.outcomes[0].source_item_id, "i1");
+});
+
+Deno.test("the model is told which item it is curating", async () => {
+  const d = deps({ take: () => Promise.resolve(queued(1)) });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.calls[0].prompt.includes("source_item_id: i1"), true);
+  assertEquals(d.calls[0].prompt.includes("kind: meeting"), true);
+});
+
+Deno.test("a batch that fails closes its run row as failed, not ok", async () => {
+  // D8: the run row is the only evidence a batch ran. A row that says `ok`
+  // after a failure hides the failure from `brain status`.
+  const d = deps({
+    take: () => Promise.resolve(queued(1)),
+    record: () => Promise.reject(new Error("the transaction failed")),
+  });
+
+  await assertRejects(() => runBatch(d.deps));
+
+  const closed = d.runs.find((r) => r.id === "run-1");
+  assertEquals(closed?.status, "failed");
+});
+
+Deno.test("a failure reading the day's spend still closes the run row", async () => {
+  const d = deps({ neuronsSpentToday: () => Promise.reject(new Error("db down")) });
+
+  await assertRejects(() => runBatch(d.deps));
+
+  const closed = d.runs.find((r) => r.id === "run-1");
+  assertEquals(closed?.status, "failed");
+});
+
+Deno.test("the curator runs only for a caller with its trigger token", () => {
+  // Deployed without Supabase's JWT check so pg_cron can call it, the
+  // function would otherwise run a batch, and spend the neuron budget, for
+  // anyone who knows its URL.
+  const expected = "test-curator-token-not-a-real-one";
+  const call = (headers: Record<string, string>) =>
+    triggerAllowed(new Request("https://example.supabase.co/brain-curator", { method: "POST", headers }), expected);
+
+  assertEquals(call({}), false, "no token");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: "" }), false, "empty token");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: "wrong" }), false, "wrong token");
+  assertEquals(call({ Authorization: `Bearer ${expected}` }), false, "only its own header counts");
+  assertEquals(call({ [CURATOR_TOKEN_HEADER]: expected }), true);
+  assertEquals(triggerAllowed(new Request("https://x", { headers: { [CURATOR_TOKEN_HEADER]: "" } }), ""), false,
+    "an unset expected token never matches");
+});
+
+Deno.test("curator_timeout: a failed model call is counted and retried later", async () => {
+  // Failure modes: a call that times out goes back to the queue. It is counted,
+  // so it cannot loop forever; a deadline or budget requeue is not counted.
+  const d = deps({
+    take: () => Promise.resolve(queued(1)),
+    callModel: () => Promise.reject(new Error("Workers AI timed out")),
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.retried.length, 1, "the failure is counted");
+  assertEquals(d.requeued.length, 0, "and not put back uncounted");
+  assertEquals(d.written.outcomes.length, 0);
+});
+
+Deno.test("curator_timeout: after 3 attempts the item is flagged", async () => {
+  const third: QueuedItem = { ...queued(1)[0], failures: 2 };
+  const d = deps({
+    take: () => Promise.resolve([third]),
+    callModel: () => Promise.reject(new Error("Workers AI timed out")),
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.retried.length, 0, "no fourth attempt");
+  assertEquals(d.written.flags.length, 1);
+  assertEquals(d.written.outcomes[0].reason.startsWith("curator timeout"), true, d.written.outcomes[0].reason);
+  assertEquals(d.written.outcomes[0].source_item_id, "i1");
+  assertEquals(d.extras[0].attempt, 3);
+});
+
+Deno.test("curator_timeout: a refused request stops the batch cleanly", async () => {
+  // Over the free limit Cloudflare refuses rather than charging. Every later
+  // call would be refused too, so the batch stops and nothing is counted
+  // against the items.
+  let calls = 0;
+  const d = deps({
+    take: () => Promise.resolve(queued(3)),
+    callModel: () => {
+      calls += 1;
+      return Promise.reject(new ModelRefused("Workers AI returned 429"));
+    },
+  });
+
+  await runBatch(d.deps);
+
+  assertEquals(calls, 1, "no call after the first refusal");
+  assertEquals(d.requeued.length, 3, "all three go back, uncounted");
+  assertEquals(d.retried.length, 0);
+  const closed = d.runs.at(-1) as { status: string };
+  assertEquals(closed.status, "budget_reached");
+});
+
+Deno.test("curator_rescreens: the re-screen's hits are recorded (AC20)", async () => {
+  const leaky = [{
+    ...queued(1)[0],
+    body: "Use key sbp_abcdef0123456789abcdef0123 for the staging deploy. Item 1.",
+  }];
+  const d = deps({ take: () => Promise.resolve(leaky) });
+
+  await runBatch(d.deps);
+
+  assertEquals(d.extras.length, 1);
+  assertEquals(d.extras[0].screenHits.length > 0, true, "screen_hits is updated");
+  assertEquals(d.extras[0].attempt, 1);
 });

@@ -36,12 +36,9 @@ function buildParams(options: QueryOptions): URLSearchParams {
     return params;
   }
 
-  if (options.query) {
-    // websearch_to_tsquery: quoted phrases and OR behave the way someone
-    // typing into a search box expects, and a stray operator cannot produce a
-    // syntax error that would surface as a failed call.
-    params.set("tsv", `wfts(english).${options.query}`);
-  }
+  // The search term itself is NOT set here: a query string ends up in the
+  // platform's request logs. It goes to brain.search_items in the request
+  // body (see query() below), and these filters apply to that function's rows.
   if (options.kinds?.length) params.set("kind", `in.(${options.kinds.join(",")})`);
   if (options.status) params.set("status", `eq.${options.status}`);
   if (options.since) params.set("occurred_at", `gte.${options.since}`);
@@ -72,10 +69,18 @@ export function depsForToken(token: string, userId: string): McpDeps {
     },
 
     async query(options: QueryOptions): Promise<TeamItem[]> {
-      const response = await fetch(
-        `${SUPABASE_URL}/rest/v1/items?${buildParams(options)}`,
-        { headers: restHeaders(token) },
-      );
+      const params = buildParams(options);
+      // A search goes through brain.search_items, a SECURITY INVOKER RPC, so
+      // the term travels in the body. websearch_to_tsquery inside it: quoted
+      // phrases and OR behave as a search box suggests, and a stray operator
+      // cannot become a syntax error. The tier ladder applies as for a select.
+      const response = options.query && !options.id
+        ? await fetch(`${SUPABASE_URL}/rest/v1/rpc/search_items?${params}`, {
+          method: "POST",
+          headers: restHeaders(token, "brain", true),
+          body: JSON.stringify({ q: options.query }),
+        })
+        : await fetch(`${SUPABASE_URL}/rest/v1/items?${params}`, { headers: restHeaders(token) });
       if (!response.ok) {
         // Including the caller's own 401 or 403: an empty result is the right
         // answer either way, because the service never distinguishes "you may

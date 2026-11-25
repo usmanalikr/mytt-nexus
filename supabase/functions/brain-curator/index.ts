@@ -21,12 +21,21 @@
 
 import {
   CURATOR_DEFAULTS,
+  CURATOR_TOKEN_HEADER,
   type Curation,
   type CuratedItem,
   type CuratorSettings,
   neuronsFor,
+  type ScreenHit,
 } from "../_shared/types.ts";
 import { screenText } from "../_shared/screen.ts";
+import { headerTokenMatches } from "../_shared/token.ts";
+
+/** Whether this request may start a batch. Checked before anything else,
+ *  including opening a database connection's worth of work. */
+export function triggerAllowed(request: Request, expected: string): boolean {
+  return headerTokenMatches(request, CURATOR_TOKEN_HEADER, expected);
+}
 
 export interface QueuedItem {
   msg_id: number;
@@ -35,6 +44,26 @@ export interface QueuedItem {
   kind: string;
   title: string | null;
   body: string;
+  /** Model calls that have already failed for this item. Carried in the queue
+   *  message, so a deadline or budget requeue is not counted as a failure. */
+  failures?: number;
+}
+
+/** A model call failed, and has failed too often to try again. */
+export const MAX_ATTEMPTS = 3;
+
+/** The model refused the request outright: over the free limit, a bad token,
+ *  a retired model. Every later call in the batch would be refused too, so
+ *  the batch stops rather than counting a failure against each item. */
+export class ModelRefused extends Error {
+  override name = "ModelRefused";
+}
+
+export interface RecordExtra {
+  /** Which attempt this outcome came from, 1 to MAX_ATTEMPTS. */
+  attempt: number;
+  /** What the curator's own screen caught (AC20). Empty if nothing. */
+  screenHits: ScreenHit[];
 }
 
 export interface ModelAnswer {
@@ -51,9 +80,13 @@ export interface CuratorDeps {
   deadline: number;
   take(n: number): Promise<QueuedItem[]>;
   callModel(call: { prompt: string; body: string }): Promise<ModelAnswer>;
-  /** One transaction: the outcome and its items land together or not at all. */
-  record(curation: Curation, items: CuratedItem[]): Promise<void>;
+  /** One transaction: the outcome, its items and the deletion of queue message
+   *  `msgId` land together or not at all. */
+  record(curation: Curation, items: CuratedItem[], msgId: number, extra: RecordExtra): Promise<void>;
+  /** Visible again at once, nothing counted: the item was never tried. */
   requeue(msgId: number): Promise<void>;
+  /** The model call failed: back on the queue with one more failure counted. */
+  retryLater(item: QueuedItem): Promise<void>;
   openRun(row: Record<string, unknown>): Promise<string>;
   closeRun(id: string, row: Record<string, unknown>): Promise<void>;
   neuronsSpentToday(): Promise<number>;
@@ -87,7 +120,13 @@ export async function policy(): Promise<string> {
   );
 }
 
-function prompt(policyBody: string, item: QueuedItem): string {
+/** The system prompt for one item: the policy, byte for byte, then the item's
+ *  identity. Exported so the comparison check (eval/curate.ts) sends exactly
+ *  what production sends. */
+export function prompt(
+  policyBody: string,
+  item: Pick<QueuedItem, "private_item_id" | "kind" | "title">,
+): string {
   return policyBody +
     "\n\n---\n\n" +
     "You are curating one source item for the MyTT brain. Follow the policy above exactly.\n" +
@@ -180,18 +219,30 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
   // it would leave nothing at all (D8).
   const runId = await deps.openRun({ kind: "curate", model: settings.model });
 
-  let spent = await deps.neuronsSpentToday();
-  const startingSpend = spent;
+  let spent = 0;
+  let startingSpend = 0;
   let done = 0;
   let taken = 0;
-  let stoppedBy: "ok" | "budget_reached" = "ok";
+  let stoppedBy: "ok" | "budget_reached" | "failed" = "ok";
+  let refused = false;
   const durations: number[] = [];
 
   try {
+    // Inside the try, so a failure here still closes the run row.
+    spent = await deps.neuronsSpentToday();
+    startingSpend = spent;
+
     const items = await deps.take(settings.batchSize);
     taken = items.length;
 
     for (const item of items) {
+      if (refused) {
+        // The model refused an earlier call in this batch; this one would be
+        // refused too. Back on the queue, uncounted.
+        await deps.requeue(item.msg_id);
+        continue;
+      }
+
       const budgetLeft = settings.dailyNeuronCap - spent;
       if (budgetLeft < ESTIMATED_NEURONS_PER_ITEM) {
         // Cloudflare refuses requests over the free limit rather than charging,
@@ -217,15 +268,35 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       const screened = screenText(item.body);
       const body = screened.body;
 
+      const attempt = (item.failures ?? 0) + 1;
+      const extra: RecordExtra = { attempt, screenHits: screened.hits };
+
       const startedAt = deps.now();
       let answer: ModelAnswer;
       try {
-        answer = await deps.callModel({ prompt: await policy() + "", body });
+        answer = await deps.callModel({ prompt: prompt(await policy(), item), body });
       } catch (error) {
-        // A model failure is this item's problem, not the batch's: it goes
-        // back on the queue and the next item is tried.
-        console.error(`brain-curator: model call failed for ${item.private_item_id}`, error);
-        await deps.requeue(item.msg_id);
+        if (error instanceof ModelRefused) {
+          // A refusal is the batch's problem, not this item's: stop cleanly,
+          // and the digest's waiting_for_budget shows what is left.
+          console.error("brain-curator: the model refused the request; stopping", error.message);
+          refused = true;
+          stoppedBy = "budget_reached";
+          await deps.requeue(item.msg_id);
+          continue;
+        }
+        console.error(`brain-curator: model call ${attempt} failed for ${item.private_item_id}`, error);
+        if (attempt >= MAX_ATTEMPTS) {
+          // Plan, failure modes: after 3 attempts the item is flagged, so a
+          // person sees it in `brain review` instead of it looping forever.
+          const reason = `curator timeout: the model call failed ${attempt} times (${String(error).slice(0, 200)})`;
+          await deps.record(asFlagged(item, reason), [], item.msg_id, extra);
+          done += 1;
+        } else {
+          // This item's problem, not the batch's: it goes back on the queue
+          // with the failure counted, and the next item is tried.
+          await deps.retryLater(item);
+        }
         continue;
       }
       durations.push(deps.now() - startedAt);
@@ -238,7 +309,7 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
         // AC12 — one retry, not none and not a loop. There is no JSON mode on
         // this model (D5), so a malformed answer is expected occasionally.
         try {
-          const retry = await deps.callModel({ prompt: await policy() + "", body });
+          const retry = await deps.callModel({ prompt: prompt(await policy(), item), body });
           spent += neuronsFor(settings.model, retry.tokensIn, retry.tokensOut);
           curation = retry.json;
           problem = invalidCuration(curation);
@@ -252,6 +323,10 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
         curation = asFlagged(item, `the curator could not produce a valid answer: ${problem}`);
       }
 
+      // The id comes from the queue, never from the model: an invented or
+      // mistaken id would attach this outcome to another private item.
+      curation = { ...curation, source_item_id: item.private_item_id };
+
       if (!settings.publishEnabled && curation.outcome === "published") {
         // AC22 — until the comparison against Claude passes, nothing this
         // model publishes can be read by anyone (D10). The model's answer is
@@ -263,9 +338,12 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       }
 
       const written: CuratedItem[] = curation.outcome === "published" ? curation.items : [];
-      await deps.record(curation, written);
+      await deps.record(curation, written, item.msg_id, extra);
       done += 1;
     }
+  } catch (error) {
+    stoppedBy = "failed";
+    throw error;
   } finally {
     await deps.closeRun(runId, {
       status: stoppedBy,

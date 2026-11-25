@@ -237,3 +237,15 @@ def test_hits_count_repeats(screen):
     email_hits = [hit for hit in result.hits if hit.pattern_id == "email"]
     assert len(email_hits) == 1
     assert email_hits[0].count == 3
+
+
+def test_screen_is_not_quadratic_on_lists_of_numbers():
+    """A pasted CSV or spreadsheet export is a long list of numbers. The money
+    rules once matched numbers as \\d[\\d,]*, which took 16 seconds on 20 KB."""
+    import time
+
+    from brain.screen import Screen
+
+    started = time.monotonic()
+    Screen().screen_text("1," * 10_000)
+    assert time.monotonic() - started < 1.0

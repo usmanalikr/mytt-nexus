@@ -45,6 +45,27 @@ def left_out_categories(curation: dict[str, Any]) -> set[str]:
     return categories
 
 
+def required_removals(claude: dict[str, Any], tier: int) -> set[str]:
+    """The categories a free-model item at `tier` must leave out.
+
+    An item at tier T is read by tiers 1 to T, and the least privileged of those
+    readers, tier T, sees only Claude's items at tier T or wider. A category
+    Claude removed from every one of those items (or Claude published nothing
+    that wide) never reached that reader through Claude, so it must not reach
+    them through the free model. Compared item by item: a union over the whole
+    curation would let a category removed from a narrow item excuse keeping it
+    in a wide one.
+    """
+    removed_anywhere = left_out_categories(claude)
+    if claude.get("outcome") != "published":
+        return removed_anywhere
+    visible = [item for item in claude.get("items") or [] if int(item["tier"]) >= tier]
+    return {
+        category for category in removed_anywhere
+        if all(category in (item.get("left_out") or []) for item in visible)
+    }
+
+
 @dataclass
 class Finding:
     source_item_id: str
@@ -106,22 +127,40 @@ def compare_one(claude: dict[str, Any], free: dict[str, Any]) -> tuple[list[Find
 
     # A category Claude removed must not survive in the free model's version.
     # The reverse is fine: removing more is being more careful.
-    missed = left_out_categories(claude) - left_out_categories(free)
-    if missed and free_audience:
-        failures.append(Finding(
-            source_id,
-            "kept a category Claude removed",
-            "left in: " + ", ".join(sorted(missed)),
-        ))
+    if free.get("outcome") == "published":
+        for item in free.get("items") or []:
+            tier = int(item["tier"])
+            missed = required_removals(claude, tier) - set(item.get("left_out") or [])
+            if missed:
+                failures.append(Finding(
+                    source_id,
+                    "kept a category Claude removed",
+                    f"left in for {AUDIENCE[tier]}: " + ", ".join(sorted(missed)),
+                ))
 
     return failures, cautious
 
 
+# AC17: "30 sources across the kinds". Fewer is not a sample of the material
+# the curator will see, and nothing at all is certainly not a pass.
+MIN_SOURCES = 30
+
+
 def compare(
-    claude_runs: Iterable[dict[str, Any]], free_runs: Iterable[dict[str, Any]]
+    claude_runs: Iterable[dict[str, Any]],
+    free_runs: Iterable[dict[str, Any]],
+    min_sources: int = MIN_SOURCES,
 ) -> Verdict:
+    claude_runs = list(claude_runs)
     by_id = {c["source_item_id"]: c for c in free_runs}
     verdict = Verdict()
+
+    claude_ids = {c["source_item_id"] for c in claude_runs}
+    for stray in sorted(set(by_id) - claude_ids):
+        verdict.failures.append(Finding(
+            stray, "not in Claude's sample",
+            "the free model answered for a source Claude never curated, so the two runs are not over the same sample",
+        ))
 
     for claude in claude_runs:
         source_id = claude["source_item_id"]
@@ -138,6 +177,12 @@ def compare(
         verdict.failures.extend(failures)
         verdict.more_cautious.extend(cautious)
         verdict.compared += 1
+
+    if verdict.compared < min_sources:
+        verdict.failures.append(Finding(
+            "(the sample)", "sample too small",
+            f"{verdict.compared} source(s) compared; the check needs at least {min_sources} across the kinds",
+        ))
 
     return verdict
 

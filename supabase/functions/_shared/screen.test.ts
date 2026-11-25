@@ -80,3 +80,9 @@ Deno.test("an empty body is handled without a special case", () => {
   assertEquals(result.body, "");
   assertEquals(result.hits.length, 0);
 });
+
+Deno.test("the screen is not quadratic on lists of numbers", () => {
+  const started = performance.now();
+  screenText("1,".repeat(10_000));
+  assertEquals(performance.now() - started < 1000, true);
+});

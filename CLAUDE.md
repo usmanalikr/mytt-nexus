@@ -47,8 +47,8 @@ Written by slice 0:
 
 - Contract check: `python3 contract/check.py` — the patterns compile in both Python and JavaScript, the schemas are valid, and the screen redacts what it must. Run this after any change to `contract/`.
 - pgTAP: `supabase/tests/run.sh` — starts a throwaway Postgres, applies the migration, runs the access-rule tests and the up/down/up check.
-- Python tests: `python3 -m pytest` — 87 tests.
-- Edge Function tests: `deno test -A supabase/functions` — 50 tests, type-checked. They import nothing from the network: jsr.io is outside the allowlist, so they use `node:assert` through `_shared/testing.ts`.
+- Python tests: `python3 -m pytest` — 142 tests. Needs Python 3.11 or later: on a Mac, `python3.12 -m venv .venv && .venv/bin/pip install -e '.[dev]'`, then `.venv/bin/python -m pytest`.
+- Edge Function tests: `deno test -A supabase/functions` — 88 tests, type-checked. They import nothing from the network: jsr.io is outside the allowlist, so they use `node:assert` through `_shared/testing.ts`.
 - Type-check the shared types: `deno check supabase/functions/_shared/types.ts`
 
 `supabase start` is **not** the pgTAP path: the local stack's images cannot be pulled through the environment's network allowlist. `supabase/tests/run.sh` uses a local Postgres with stand-ins for `auth.uid()` and the Supabase roles.

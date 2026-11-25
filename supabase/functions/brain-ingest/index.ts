@@ -18,7 +18,8 @@ import {
   type InboxItem,
   type WatermarkUpdate,
 } from "../_shared/types.ts";
-import { screenText, sha256 } from "../_shared/screen.ts";
+import { isNeverPublished, screenText, sha256 } from "../_shared/screen.ts";
+import { headerTokenMatches } from "../_shared/token.ts";
 
 export interface ScopeRule {
   source: string;
@@ -40,24 +41,11 @@ const json = (body: unknown, status = 200) =>
 
 // --- the token ---------------------------------------------------------------
 
-/** Constant time, so a wrong token cannot be found a character at a time.
- *  Compares the full length of both strings whatever happens. */
-function tokensMatch(given: string, expected: string): boolean {
-  const a = new TextEncoder().encode(given);
-  const b = new TextEncoder().encode(expected);
-  let diff = a.length ^ b.length;
-  const n = Math.max(a.length, b.length);
-  for (let i = 0; i < n; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  return diff === 0;
-}
-
 /** Only from its own header. A token the function accepted in `Authorization`
  *  would collide with a signed-in user's own bearer token on the same host,
  *  and would be sent on every REST call the session makes (D12). */
 function authorised(request: Request, expected: string): boolean {
-  const given = request.headers.get(INGEST_TOKEN_HEADER);
-  if (!given) return false;
-  return tokensMatch(given, expected);
+  return headerTokenMatches(request, INGEST_TOKEN_HEADER, expected);
 }
 
 // --- the batch ---------------------------------------------------------------
@@ -188,20 +176,35 @@ export async function handler(request: Request, deps: Deps): Promise<Response> {
   let queued = 0;
   let sentToReview = 0;
   let rejected = 0;
+  let withheld = 0;
 
   for (const item of batch.items) {
+    // AC6, the copy that counts. A never-published source, or an item the
+    // gather already withheld, is dropped here: never stored, never queued,
+    // never seen by the curator. The caller's `withheld: false` is not trusted.
+    if (isNeverPublished(item.source) || item.screened?.withheld === true) {
+      withheld += 1;
+      continue;
+    }
+
     // Screen before anything else touches it. The gather screened it and this
     // is the second of three passes (D6); the endpoint cannot assume the first
-    // one happened.
+    // one happened. The title and the url are screened too: `brain review`
+    // offers the title as the published title.
     const screened = screenText(item.body ?? "");
+    const title = item.title ? screenText(item.title) : null;
+    const url = item.url ? screenText(item.url) : null;
+    const hits = [...screened.hits, ...(title?.hits ?? []), ...(url?.hits ?? [])];
     const stored: InboxItem = {
       ...item,
+      title: title ? title.body : item.title,
+      url: url ? url.body : item.url,
       body: screened.body,
       body_sha256: await sha256(screened.body),
       screened: {
         patterns_version: screened.patterns_version,
-        hits: screened.hits,
-        withheld: item.screened?.withheld ?? false,
+        hits,
+        withheld: false,
       },
     };
 
@@ -228,7 +231,7 @@ export async function handler(request: Request, deps: Deps): Promise<Response> {
     await deps.setWatermark(mark.source, mark.watermark);
   }
 
-  return json({ accepted, queued, sent_to_review: sentToReview, rejected });
+  return json({ accepted, queued, sent_to_review: sentToReview, rejected, withheld });
 }
 
 // Deno.serve is only reached when deployed; the tests call handler() directly
