@@ -127,9 +127,15 @@ tests:
   | Role | Used by | May | Connection kept in |
   |---|---|---|---|
   | `brain_intake` | The `brain-ingest` Edge Function | Write `brain_private.items`, `intake_review`, `sources` and the queue | Edge Function secret `BRAIN_INTAKE_DB_URL` |
-  | `brain_curator` | The `brain-curator` Edge Function | Read `brain_private.items` and the queue; write `brain.items`, `outcomes`, `flags` and `runs` | Edge Function secret `BRAIN_CURATOR_DB_URL` |
+  | `brain_curator` | The `brain-curator` Edge Function | Read `brain_private.items` and the queue; update only the `screen_hits` of a private item (AC20); write `brain.items`, `outcomes`, `flags` and `runs` | Edge Function secret `BRAIN_CURATOR_DB_URL` |
 
   Reading `em_tracker` stays with the read-only Supabase connector during gathering.
+
+  *Changed by the review on 25 Nov:*
+  - **Neither role has `BYPASSRLS`.** That attribute covers every table in the database, not just the brain's. Each role instead has its own RLS policy on the brain tables it is granted.
+  - **Queue grants cover `pgmq.q_brain_curation` only,** not every queue in the project.
+  - **The curator may update `screen_hits`** (a column grant), so its re-screen can record what it caught. It still cannot change a private body.
+  - **MCP search goes through `brain.search_items(q)`,** a `SECURITY INVOKER` RPC. The search term travels in the request body instead of a URL, which would put it in the platform's request logs.
 - **D3. You apply the migrations.** Sessions write them as files under `supabase/migrations/`, and you apply them with the Supabase CLI or the dashboard's SQL editor. Sessions never hold a key that can change the production schema.
 - **D4. The MCP service is a Supabase Edge Function**, `brain-mcp`.
   - **Sign-in:** Claude signs in to it with Supabase Auth's built-in OAuth server, so you sign in with your own account.

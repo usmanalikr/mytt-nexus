@@ -9,7 +9,7 @@
 
 import postgres from "npm:postgres@3";
 import { CURATOR_DEFAULTS, type Curation, type CuratedItem } from "../_shared/types.ts";
-import { type CuratorDeps, type QueuedItem, triggerAllowed } from "./index.ts";
+import { type CuratorDeps, type QueuedItem, type RecordExtra, triggerAllowed } from "./index.ts";
 import { callWorkersAI } from "./model.ts";
 
 const DB_URL = "BRAIN_CURATOR_DB_URL";
@@ -59,7 +59,9 @@ export async function serveWithDatabaseDeps(
       deadline: BATCH_DEADLINE_MS,
 
       async take(n) {
-        const rows = await sql<{ msg_id: number; message: { private_item_id: string } }[]>`
+        const rows = await sql<
+          { msg_id: number; message: { private_item_id: string; failures?: number } }[]
+        >`
           select msg_id, message from pgmq.read('brain_curation', 120, ${n})
         `;
         if (!rows.length) return [];
@@ -72,20 +74,36 @@ export async function serveWithDatabaseDeps(
         const byId = new Map(items.map((i) => [i.private_item_id, i]));
         return rows
           .filter((r) => byId.has(r.message.private_item_id))
-          .map((r) => ({ ...byId.get(r.message.private_item_id)!, msg_id: r.msg_id }));
+          .map((r) => ({
+            ...byId.get(r.message.private_item_id)!,
+            msg_id: r.msg_id,
+            failures: Number(r.message.failures ?? 0),
+          }));
       },
 
       callModel: (call) => callWorkersAI(config.model, call),
 
-      async record(curation: Curation, items: CuratedItem[], msgId: number) {
+      async record(curation: Curation, items: CuratedItem[], msgId: number, extra: RecordExtra) {
         // One transaction per source item (AC9). A half-written item would
         // look curated while having neither a team item nor a flag, which is
         // the one state nothing downstream would ever surface.
         await sql.begin(async (tx) => {
           await tx`
-            insert into brain.outcomes (private_item_id, outcome, reason, model)
-            values (${curation.source_item_id}, ${curation.outcome}, ${curation.reason}, ${config.model})
+            insert into brain.outcomes (private_item_id, outcome, reason, model, attempt)
+            values (${curation.source_item_id}, ${curation.outcome}, ${curation.reason},
+                    ${config.model}, ${extra.attempt})
           `;
+
+          if (extra.screenHits.length) {
+            // AC20: what this third screen caught is added to the item's hit
+            // list. The body is left as it is; the model saw the redacted copy.
+            await tx`
+              update brain_private.items
+              set screen_hits = screen_hits || ${tx.json(extra.screenHits as unknown as Parameters<typeof tx.json>[0])}::jsonb,
+                  updated_at = now()
+              where id = ${curation.source_item_id}
+            `;
+          }
 
           if (curation.outcome === "flagged") {
             await tx`
@@ -113,6 +131,18 @@ export async function serveWithDatabaseDeps(
       async requeue(msgId: number) {
         // Visible again immediately: the next cron tick picks it up.
         await sql`select pgmq.set_vt('brain_curation', ${msgId}, 0)`;
+      },
+
+      async retryLater(item: QueuedItem) {
+        // A pgmq message cannot be edited, so the failure count travels in a
+        // fresh message. Send and delete together, so the item is never both
+        // queued twice and never lost.
+        await sql.begin(async (tx) => {
+          await tx`select pgmq.send('brain_curation', ${
+            tx.json({ private_item_id: item.private_item_id, failures: (item.failures ?? 0) + 1 })
+          })`;
+          await tx`select pgmq.delete('brain_curation', ${item.msg_id}::bigint)`;
+        });
       },
 
       async openRun(row) {

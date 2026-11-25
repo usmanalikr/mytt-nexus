@@ -318,7 +318,7 @@ create policy tier_read on brain.items
   using (brain.can_read_tier(tier));
 
 -- Only the owner writes team items by hand; the curator writes as brain_curator,
--- which bypasses RLS through its grants below, not through a policy.
+-- through its own curator_role policy below.
 drop policy if exists owner_write on brain.items;
 create policy owner_write on brain.items
   for all to public
@@ -361,6 +361,9 @@ grant select                 on brain_private.scope_rules   to brain_intake;
 grant select, insert, update on brain_private.intake_review to brain_intake;
 
 grant select on brain_private.items    to brain_curator;
+-- AC20: the curator's re-screen records what it caught. Only the hit list and
+-- the pattern version: the body stays as the earlier screens left it.
+grant update (screen_hits, patterns_version, updated_at) on brain_private.items to brain_curator;
 grant select on brain_private.sources  to brain_curator;
 grant select, insert, update on brain_private.digests to brain_curator;
 
@@ -373,9 +376,39 @@ grant select                 on brain.members  to brain_curator;
 grant usage, select on all sequences in schema brain to brain_curator;
 
 -- Both roles act inside their own Edge Function and must not be filtered by the
--- owner-only policies, so they are allowed to bypass RLS on these tables only.
-alter role brain_intake  bypassrls;
-alter role brain_curator bypassrls;
+-- owner-only policies. They get a policy of their own on each brain table, NOT
+-- BYPASSRLS: that is a role attribute, so it would apply to every table in the
+-- database, including any other app's table that relies on RLS. The grants
+-- above still decide what each role may do; these policies only let it past
+-- RLS on the brain's own tables.
+alter role brain_intake  nobypassrls;
+alter role brain_curator nobypassrls;
+
+do $$
+declare
+  t text;
+begin
+  foreach t in array array[
+    'brain_private.items', 'brain_private.sources', 'brain_private.scope_rules',
+    'brain_private.intake_review'
+  ]
+  loop
+    execute format('drop policy if exists intake_role on %s', t);
+    execute format(
+      'create policy intake_role on %s for all to brain_intake using (true) with check (true)', t);
+  end loop;
+
+  foreach t in array array[
+    'brain_private.items', 'brain_private.sources', 'brain_private.digests',
+    'brain.items', 'brain.outcomes', 'brain.flags', 'brain.runs', 'brain.members'
+  ]
+  loop
+    execute format('drop policy if exists curator_role on %s', t);
+    execute format(
+      'create policy curator_role on %s for all to brain_curator using (true) with check (true)', t);
+  end loop;
+end
+$$;
 
 -- People and agents arrive as `authenticated`, carrying their own JWT: that is
 -- how the MCP service and the review and digest commands connect. Without these
@@ -408,6 +441,34 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Search (AC14, AC15). An RPC rather than a filter in the URL, so the MCP
+-- service can send the search term in a request body: a query string ends up
+-- in the platform's request logs, and a search can carry a person's name.
+-- SECURITY INVOKER, so the tier ladder applies to the caller as it does to a
+-- plain select.
+-- ---------------------------------------------------------------------------
+
+create or replace function brain.search_items(q text)
+returns setof brain.items
+language sql
+stable
+security invoker
+set search_path = ''
+as $$
+  select i.* from brain.items i
+  where i.tsv @@ pg_catalog.websearch_to_tsquery('english', q);
+$$;
+
+revoke all on function brain.search_items(text) from public;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    grant execute on function brain.search_items(text) to authenticated;
+  end if;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Seed: MyTT is the only thing in scope (AC2).
 -- ---------------------------------------------------------------------------
 
@@ -425,8 +486,15 @@ begin
   if exists (select 1 from pg_available_extensions where name = 'pgmq') then
     create extension if not exists pgmq;
     perform pgmq.create('brain_curation');
+    -- The brain's own queue and nothing else (D2). A grant on every table in
+    -- pgmq would let brain_intake, the role behind a public endpoint, read and
+    -- delete messages in any other queue the project has.
     execute 'grant usage on schema pgmq to brain_intake, brain_curator';
-    execute 'grant select, insert, update, delete on all tables in schema pgmq to brain_intake, brain_curator';
+    -- pgmq.send inserts and reads back the new msg_id.
+    execute 'grant select, insert on pgmq.q_brain_curation to brain_intake';
+    -- pgmq.read, set_vt, delete and metrics; send for a retry, which carries
+    -- the item's failure count in a fresh message.
+    execute 'grant select, insert, update, delete on pgmq.q_brain_curation to brain_curator';
   else
     raise warning 'pgmq not available: queue skipped (expected on a local test cluster)';
   end if;

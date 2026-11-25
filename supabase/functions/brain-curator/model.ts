@@ -5,7 +5,7 @@
 // Slice 3 owns this file.
 
 import type { Curation } from "../_shared/types.ts";
-import type { ModelAnswer } from "./index.ts";
+import { type ModelAnswer, ModelRefused } from "./index.ts";
 
 const CF_ACCOUNT = "CF_ACCOUNT_ID";
 const CF_TOKEN = "CF_API_TOKEN";
@@ -49,10 +49,16 @@ export async function callWorkersAI(
     // What happened on 20 November: Cloudflare retired 24 models, this one
     // among them. The message says what to do rather than leaving a bare 410
     // in the logs.
-    throw new Error(
+    throw new ModelRefused(
       `${model} has been retired by Cloudflare (410). Set CF_MODEL to a live model and ` +
         "re-run the comparison check (AC17) before publishing again.",
     );
+  }
+  if ([401, 403, 429].includes(response.status)) {
+    // Over the free limit (Cloudflare refuses rather than charging), rate
+    // limited, or a bad token: every other call in the batch would get the
+    // same answer, so the batch stops instead of counting it against items.
+    throw new ModelRefused(`Workers AI refused the request (${response.status})`);
   }
   if (!response.ok) {
     throw new Error(`Workers AI returned ${response.status}: ${(await response.text()).slice(0, 300)}`);

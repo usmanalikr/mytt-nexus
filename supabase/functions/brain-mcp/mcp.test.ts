@@ -153,3 +153,29 @@ Deno.test("the MCP service never holds the service key", async () => {
   assertEquals(d.usesServiceKey, false);
   assertEquals(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"), undefined);
 });
+
+Deno.test("mcp_access_log_has_no_content: the search term never travels in a URL", async () => {
+  // The access log stores only a hash of the query (AC15), but a term sent as
+  // a PostgREST filter in the query string would sit in the platform's request
+  // logs in plain text. The term goes in the request body instead.
+  const { depsForToken } = await import("./deps.ts");
+  const seen: { url: string; method: string; body: string }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    seen.push({ url: String(input), method: init?.method ?? "GET", body: String(init?.body ?? "") });
+    return Promise.resolve(new Response("[]", { status: 200 }));
+  }) as typeof fetch;
+  try {
+    await depsForToken("token", DEVELOPER).query({ query: "Jane Doe salary", kinds: ["decision"] });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assertEquals(seen.length, 1);
+  const [call] = seen;
+  assertEquals(call.url.includes("Jane"), false, `the term reached the URL: ${call.url}`);
+  assertEquals(call.method, "POST");
+  assertEquals(JSON.parse(call.body).q, "Jane Doe salary");
+  // The other filters are not sensitive, and still apply.
+  assertEquals(call.url.includes("kind=in.%28decision%29") || call.url.includes("kind=in.(decision)"), true);
+});

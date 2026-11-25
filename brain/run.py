@@ -21,6 +21,12 @@ screening happens before anything leaves the machine.
 three of four sources advances three watermarks. Moving the fourth would mean
 its missed window is never asked for again, and nothing downstream would ever
 notice the gap.
+
+**A watermark is the time the source was gathered, not the time it was
+posted.** Anything created between the connector call and `brain run` was not
+in this gather; a watermark stamped at post time would skip it for good. Each
+inbox file records its `gathered_at`, and a source with several files takes the
+earliest.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from brain.contract import Watermark
-from brain.ingest import IngestClient, IngestError, load_inbox
+from brain.ingest import IngestClient, IngestError
 from brain.screen import Screen
 
 INBOX = Path("inbox")
@@ -49,8 +55,9 @@ def gather_plan(watermarks: Iterable[Watermark], sources: list[str] | None = Non
         lines.append(f"  {source:<40} since {since}")
     lines += [
         "",
-        "Each file is a list of inbox items, or {\"items\": [...]}, matching",
-        "contract/inbox-item.schema.json. Then run `brain run` with no --plan.",
+        "Write each file with brain.run.write_inbox(source, items, gathered_at=...),",
+        "giving the time the connector call STARTED: it becomes the watermark.",
+        "Items match contract/inbox-item.schema.json. Then run `brain run` with no --plan.",
     ]
     return "\n".join(lines)
 
@@ -62,6 +69,27 @@ def inbox_files(root: Path = INBOX) -> list[Path]:
 def source_of(items: list[dict[str, Any]]) -> str | None:
     sources = {i.get("source") for i in items if i.get("source")}
     return next(iter(sources)) if len(sources) == 1 else None
+
+
+def read_inbox_file(path: Path) -> tuple[list[dict[str, Any]], str | None, datetime]:
+    """An inbox file's items, its source and when it was gathered.
+
+    A file is a list of items, or {"source", "gathered_at", "items"} as
+    write_inbox makes it. Without a gathered_at, the time the file was written
+    stands in: it is never later than the gather was.
+    """
+    payload = json.loads(path.read_text())
+    meta = payload if isinstance(payload, dict) else {}
+    items = meta.get("items", []) if meta else payload
+    source = meta.get("source") or source_of(items)
+    stamp = meta.get("gathered_at")
+    if stamp:
+        gathered = datetime.fromisoformat(stamp)
+        if gathered.tzinfo is None:
+            gathered = gathered.replace(tzinfo=timezone.utc)
+    else:
+        gathered = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return items, source, gathered
 
 
 def main(args) -> int:
@@ -89,13 +117,21 @@ def main(args) -> int:
     screen = Screen()
     sending: list[dict[str, Any]] = []
     withheld = 0
-    gathered_sources: set[str] = set()
+    gathered_at: dict[str, datetime] = {}
+    processed: list[Path] = []
     totals: dict[str, int] = {}
 
     for path in files:
-        items = load_inbox(path)
-        if args.source and source_of(items) not in args.source:
+        items, source, gathered = read_inbox_file(path)
+        if args.source and source not in args.source:
+            # Left in the inbox for a later run: archiving it would mean it is
+            # never posted.
             continue
+        processed.append(path)
+        if source:
+            # The earliest gather of a source is the one its watermark may
+            # claim; anything later could have missed what the first saw.
+            gathered_at[source] = min(gathered, gathered_at.get(source, gathered))
         for item in items:
             screened = screen.screen_item(item)
             for hit in screened["screened"]["hits"]:
@@ -104,10 +140,8 @@ def main(args) -> int:
                 withheld += 1
                 continue
             sending.append(screened)
-            if screened.get("source"):
-                gathered_sources.add(screened["source"])
 
-    print(f"{len(files)} file(s), {len(sending)} item(s) to post, {withheld} withheld")
+    print(f"{len(processed)} file(s), {len(sending)} item(s) to post, {withheld} withheld")
     for pattern_id, count in sorted(totals.items(), key=lambda kv: -kv[1]):
         print(f"  redacted {count:>4}  {pattern_id}")
 
@@ -116,13 +150,15 @@ def main(args) -> int:
         return 0
 
     now = datetime.now(timezone.utc)
-    marks = [Watermark(source=s, watermark=now) for s in sorted(gathered_sources)]
+    marks = [Watermark(source=s, watermark=gathered_at[s]) for s in sorted(gathered_at)]
 
     # One batch per 500 items, as the contract caps it. Each batch is its own
     # transaction, so a failure part-way leaves earlier batches stored and
     # queued rather than rolling back work that was fine.
     posted = 0
-    for start in range(0, len(sending), 500):
+    # A source gathered with nothing new still moves its watermark, so a run
+    # with no items still posts one (empty) batch to carry them.
+    for start in range(0, max(len(sending), 1 if marks else 0), 500):
         chunk = sending[start : start + 500]
         is_last = start + 500 >= len(sending)
         result = client.post_batch(chunk, marks if is_last else [])
@@ -132,22 +168,35 @@ def main(args) -> int:
             f"to review {result.sent_to_review}, rejected {result.rejected}"
         )
 
-    if marks:
-        print(f"watermarks advanced for {len(marks)} source(s) to {now.isoformat()}")
+    for mark in marks:
+        print(f"watermark for {mark.source} advanced to {mark.watermark.isoformat()}")
 
     archive = INBOX / "posted"
     archive.mkdir(exist_ok=True)
-    for path in files:
+    for path in processed:
         path.rename(archive / f"{now:%Y%m%dT%H%M%S}-{path.name}")
-    print(f"moved {len(files)} file(s) to {archive}/ — gathered content stays out of git")
+    print(f"moved {len(processed)} file(s) to {archive}/ — gathered content stays out of git")
 
     return 0
 
 
-def write_inbox(source: str, items: list[dict[str, Any]], root: Path = INBOX) -> Path:
+def write_inbox(
+    source: str,
+    items: list[dict[str, Any]],
+    root: Path = INBOX,
+    *,
+    gathered_at: datetime | None = None,
+) -> Path:
     """For the session to call when it has gathered a source. Keeps the file
-    naming in one place so `brain run` and `run/gather.md` cannot disagree."""
+    naming in one place so `brain run` and `run/gather.md` cannot disagree.
+
+    `gathered_at` is when the connector call STARTED, which becomes the
+    source's watermark. Pass it: the default, the time of this call, is later
+    than the gather and could skip anything created while it ran.
+    """
     root.mkdir(exist_ok=True)
+    when = gathered_at or datetime.now(timezone.utc)
     path = root / f"{source.replace('.', '-')}.json"
-    path.write_text(json.dumps({"items": items}, indent=2))
+    path.write_text(json.dumps(
+        {"source": source, "gathered_at": when.isoformat(), "items": items}, indent=2))
     return path

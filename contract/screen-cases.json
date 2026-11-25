@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "note": "Golden cases for the screen, read by both the Python tests and the Deno tests. The screen runs three times in three places (D6), and two of those are in TypeScript, so 'the same patterns' is not enough on its own: the same patterns applied in a different order, or with a different allow pass, redact different things. These cases are what 'the same' means. Add a case here before fixing a screen bug, not after.",
   "cases": [
     {
@@ -220,6 +220,84 @@
       "id": "leaves-three-part-versions-alone",
       "in": "Shipped 2.14.1 and v3.0 on 2026-11-25.",
       "out": "Shipped 2.14.1 and v3.0 on 2026-11-25.",
+      "hits": []
+    },
+    {
+      "id": "phone-tt-local-brackets",
+      "in": "Call the ministry on (868) 555-1234 today.",
+      "out": "Call the ministry on [redacted: phone] today.",
+      "hits": [
+        "phone-local"
+      ]
+    },
+    {
+      "id": "phone-dashed-ten-digits",
+      "in": "Her number is 868-555-1234.",
+      "out": "Her number is [redacted: phone].",
+      "hits": [
+        "phone-local"
+      ]
+    },
+    {
+      "id": "phone-pk-mobile-local",
+      "in": "Reach him on 0300 1234567 after six.",
+      "out": "Reach him on [redacted: phone] after six.",
+      "hits": [
+        "phone-local"
+      ]
+    },
+    {
+      "id": "card-amex",
+      "in": "Card 3782 822463 10005 was charged.",
+      "out": "Card [redacted: account number] was charged.",
+      "hits": [
+        "card-number"
+      ]
+    },
+    {
+      "id": "money-magnitude-word",
+      "in": "A budget of 1.5 million dollars was agreed.",
+      "out": "A budget of [redacted: amount] was agreed.",
+      "hits": [
+        "currency-suffixed"
+      ]
+    },
+    {
+      "id": "money-k-suffix",
+      "in": "They quoted 50k USD for phase two.",
+      "out": "They quoted [redacted: amount] for phase two.",
+      "hits": [
+        "currency-suffixed"
+      ]
+    },
+    {
+      "id": "money-prefixed-magnitude",
+      "in": "Signed off at $2.5m last week.",
+      "out": "Signed off at [redacted: amount] last week.",
+      "hits": [
+        "currency-prefixed"
+      ]
+    },
+    {
+      "id": "money-spaced-currency-dotted",
+      "in": "The fee is € 1.000.000 in total.",
+      "out": "The fee is [redacted: amount] in total.",
+      "hits": [
+        "currency-prefixed"
+      ]
+    },
+    {
+      "id": "hours-at-a-rate",
+      "in": "Then we bill 40 hrs at 150 for the sprint.",
+      "out": "Then we [redacted: hours billed] for the sprint.",
+      "hits": [
+        "hours-billed"
+      ]
+    },
+    {
+      "id": "leaves-ordinary-counts-alone",
+      "in": "Sprint 12 closed 3 tickets in 2 days; 1.5 million users by 2027.",
+      "out": "Sprint 12 closed 3 tickets in 2 days; 1.5 million users by 2027.",
       "hits": []
     }
   ]

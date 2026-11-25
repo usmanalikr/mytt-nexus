@@ -26,6 +26,7 @@ import {
   type CuratedItem,
   type CuratorSettings,
   neuronsFor,
+  type ScreenHit,
 } from "../_shared/types.ts";
 import { screenText } from "../_shared/screen.ts";
 import { headerTokenMatches } from "../_shared/token.ts";
@@ -43,6 +44,26 @@ export interface QueuedItem {
   kind: string;
   title: string | null;
   body: string;
+  /** Model calls that have already failed for this item. Carried in the queue
+   *  message, so a deadline or budget requeue is not counted as a failure. */
+  failures?: number;
+}
+
+/** A model call failed, and has failed too often to try again. */
+export const MAX_ATTEMPTS = 3;
+
+/** The model refused the request outright: over the free limit, a bad token,
+ *  a retired model. Every later call in the batch would be refused too, so
+ *  the batch stops rather than counting a failure against each item. */
+export class ModelRefused extends Error {
+  override name = "ModelRefused";
+}
+
+export interface RecordExtra {
+  /** Which attempt this outcome came from, 1 to MAX_ATTEMPTS. */
+  attempt: number;
+  /** What the curator's own screen caught (AC20). Empty if nothing. */
+  screenHits: ScreenHit[];
 }
 
 export interface ModelAnswer {
@@ -61,8 +82,11 @@ export interface CuratorDeps {
   callModel(call: { prompt: string; body: string }): Promise<ModelAnswer>;
   /** One transaction: the outcome, its items and the deletion of queue message
    *  `msgId` land together or not at all. */
-  record(curation: Curation, items: CuratedItem[], msgId: number): Promise<void>;
+  record(curation: Curation, items: CuratedItem[], msgId: number, extra: RecordExtra): Promise<void>;
+  /** Visible again at once, nothing counted: the item was never tried. */
   requeue(msgId: number): Promise<void>;
+  /** The model call failed: back on the queue with one more failure counted. */
+  retryLater(item: QueuedItem): Promise<void>;
   openRun(row: Record<string, unknown>): Promise<string>;
   closeRun(id: string, row: Record<string, unknown>): Promise<void>;
   neuronsSpentToday(): Promise<number>;
@@ -200,6 +224,7 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
   let done = 0;
   let taken = 0;
   let stoppedBy: "ok" | "budget_reached" | "failed" = "ok";
+  let refused = false;
   const durations: number[] = [];
 
   try {
@@ -211,6 +236,13 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
     taken = items.length;
 
     for (const item of items) {
+      if (refused) {
+        // The model refused an earlier call in this batch; this one would be
+        // refused too. Back on the queue, uncounted.
+        await deps.requeue(item.msg_id);
+        continue;
+      }
+
       const budgetLeft = settings.dailyNeuronCap - spent;
       if (budgetLeft < ESTIMATED_NEURONS_PER_ITEM) {
         // Cloudflare refuses requests over the free limit rather than charging,
@@ -236,15 +268,35 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       const screened = screenText(item.body);
       const body = screened.body;
 
+      const attempt = (item.failures ?? 0) + 1;
+      const extra: RecordExtra = { attempt, screenHits: screened.hits };
+
       const startedAt = deps.now();
       let answer: ModelAnswer;
       try {
         answer = await deps.callModel({ prompt: prompt(await policy(), item), body });
       } catch (error) {
-        // A model failure is this item's problem, not the batch's: it goes
-        // back on the queue and the next item is tried.
-        console.error(`brain-curator: model call failed for ${item.private_item_id}`, error);
-        await deps.requeue(item.msg_id);
+        if (error instanceof ModelRefused) {
+          // A refusal is the batch's problem, not this item's: stop cleanly,
+          // and the digest's waiting_for_budget shows what is left.
+          console.error("brain-curator: the model refused the request; stopping", error.message);
+          refused = true;
+          stoppedBy = "budget_reached";
+          await deps.requeue(item.msg_id);
+          continue;
+        }
+        console.error(`brain-curator: model call ${attempt} failed for ${item.private_item_id}`, error);
+        if (attempt >= MAX_ATTEMPTS) {
+          // Plan, failure modes: after 3 attempts the item is flagged, so a
+          // person sees it in `brain review` instead of it looping forever.
+          const reason = `curator timeout: the model call failed ${attempt} times (${String(error).slice(0, 200)})`;
+          await deps.record(asFlagged(item, reason), [], item.msg_id, extra);
+          done += 1;
+        } else {
+          // This item's problem, not the batch's: it goes back on the queue
+          // with the failure counted, and the next item is tried.
+          await deps.retryLater(item);
+        }
         continue;
       }
       durations.push(deps.now() - startedAt);
@@ -286,7 +338,7 @@ export async function runBatch(deps: CuratorDeps): Promise<void> {
       }
 
       const written: CuratedItem[] = curation.outcome === "published" ? curation.items : [];
-      await deps.record(curation, written, item.msg_id);
+      await deps.record(curation, written, item.msg_id, extra);
       done += 1;
     }
   } catch (error) {
